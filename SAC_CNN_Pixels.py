@@ -1,1 +1,1 @@
-# === Soft Actor Critic based on State ===
+# === Soft Actor Critic based on Pixels ===

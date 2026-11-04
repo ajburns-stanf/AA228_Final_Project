@@ -62,8 +62,9 @@ if __name__ == "__main__":
                     FRAMES_DIR / f"step{i:03d}_cam{cam}.png"
                 )
 
+            print("Saved frames to", FRAMES_DIR)
+
     print("Finished", N_STEPS, "steps, race_ended =", race_ended)
-    print("Saved frames to", FRAMES_DIR)
 
     # -- Clean up the simulation --
     race.stop()
