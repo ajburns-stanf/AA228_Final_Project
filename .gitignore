@@ -1,0 +1,27 @@
+# === Python ===
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# === Virtual environment ===
+.venv/
+venv/
+
+# === Simulation output ===
+frames/
+
+# === Training output (large; share checkpoints another way, or force-add a final one) ===
+runs/
+checkpoints/
+logs/
+data/
+*.pt
+*.pth
+*.npz
+
+# === Editors and OS ===
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
