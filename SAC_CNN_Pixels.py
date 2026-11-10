@@ -2,7 +2,7 @@
 
 # TODO: / things that can be improved, if necessary
 # tune the entropy parameter dynamically as training progresses (alpha)
-# use EMA of the critic/actor weights to keep training stable (if you do this initialize with 
+# use EMA of the critic/actor weights to keep training stable (if you do this initialize with
 # polyak_update(critic_1, target_critic_1, tau=1.0) so that training isnt extremely slow)
 # decide how encoder/belief update gets trained, through actor or critic
 
@@ -12,100 +12,94 @@ import torch.nn.functional as F
 from torch.distributions import Normal
 import torch.optim as optim
 
+LOG_STD_MIN, LOG_STD_MAX = -20, 2
+
+
 class CNNEncoder(nn.Module):
     def __init__(self, embedding_dim=128):
-        super(CNNEncoder, self).__init__()
+        super().__init__()
         self.conv_blocks = nn.Sequential(
             nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
             nn.MaxPool2d(kernel_size=2, stride=2),
-            
+
             nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
             nn.MaxPool2d(kernel_size=2, stride=2),
-            
+
             nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1, 1))
+            nn.AdaptiveAvgPool2d((6, 8))
         )
-        self.fc = nn.Linear(64, embedding_dim)
+        self.fc = nn.Linear(64 * 6 * 8, embedding_dim)
 
     def forward(self, x):
+        lead = x.shape[:-3]
+        x = x.reshape(-1, *x.shape[-3:]).permute(0, 3, 1, 2).float() / 255.0
         x = self.conv_blocks(x)
         x = torch.flatten(x, 1)
         embedding = self.fc(x)
-        return embedding
-    
+        return embedding.reshape(*lead, -1)
+
+
 class Actor(nn.Module):
-    def __init__(self, state_dim=128, action_dim=4, hidden_dim=256):
-        super(Actor, self).__init__()
-        self.mlpblock = nn.sequential(
-            nn.Linear(state_dim, 256),
+    def __init__(self, state_dim=128, action_dim=2, hidden_dim=256):
+        super().__init__()
+        self.mlpblock = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(256, action_dim)
+            nn.Linear(hidden_dim, 2 * action_dim)  # each action parametrized by normal distribution, mean + std
         )
-    
-    def forward(self, x):
+
+    def forward(self, x, deterministic=False):
         x = self.mlpblock(x)
-        means = torch.tensor(x[..., :2])
-        log_stds = torch.tensor(x[..., 2:])
-        stds = torch.exp(log_stds)
-        dist = Normal(means, stds)
-        raw_actions = dist.rsample()
+        means, log_stds = x.chunk(2, dim=-1)
+        log_stds = log_stds.clamp(LOG_STD_MIN, LOG_STD_MAX)
+        dist = Normal(means, torch.exp(log_stds))
+        raw_actions = means if deterministic else dist.rsample()
         actions = torch.tanh(raw_actions)
         log_prob = dist.log_prob(raw_actions) - torch.log(1 - actions.pow(2) + 1e-6)
         log_prob = log_prob.sum(dim=-1, keepdim=True)
         return actions, log_prob
 
+
 class Critic(nn.Module):
     def __init__(self, input_dim=130, hidden_dim=256):
-        super(Actor, self).__init__()
-        self.mlpblock = nn.sequential(
-            nn.Linear(input_dim, 256),
+        super().__init__()
+        self.mlpblock = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(256, 1),
-            nn.ReLU()
+            nn.Linear(hidden_dim, 1)
         )
-    
-    def forward(self, x):
-        x = self.mlpblock(x)
-        return x
-    
-class SACAGent():
-    # get observation from the environment, the main training script will supply it and call this function
-    # push it through the CNN
-    # update belief about the system through GRU with the embedding
-    # this feeds into policy, which generates the action (start off with random policy but we can kickstart the policy later with normal behavior cloning)
-    # this also is fed into the critics
-    # calculate loss, update weights
 
-    def __init__(self, state_dim, action_dim, gamma, alpha, lr):
-        self.encoder = CNNEncoder(state_dim)
-        self.belief = nn.GRU(state_dim, state_dim)
-        self.actor = Actor(state_dim, action_dim)
-        self.critic1 = Critic(state_dim+action_dim)
-        self.critic2 = Critic(state_dim+action_dim)
+    def forward(self, belief, action):
+        return self.mlpblock(torch.cat([belief, action], dim=-1))
+
+
+class SACAgent:
+    def __init__(self, state_dim=128, action_dim=2, gamma=0.99, alpha=0.2, lr=3e-4):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.encoder = CNNEncoder(state_dim).to(self.device)
+        self.belief = nn.GRU(state_dim, state_dim, batch_first=True).to(self.device)
+        self.actor = Actor(state_dim, action_dim).to(self.device)
+        self.critic1 = Critic(state_dim + action_dim).to(self.device)
+        self.critic2 = Critic(state_dim + action_dim).to(self.device)
         self.alpha = alpha
         self.gamma = gamma
         critic_params = (
-            list(self.encoder.parameters()) + 
-            list(self.belief.parameters()) + 
-            list(self.critic1.parameters()) + 
+            list(self.encoder.parameters()) +
+            list(self.belief.parameters()) +
+            list(self.critic1.parameters()) +
             list(self.critic2.parameters())
         )
         self.critic_optimizer = optim.Adam(critic_params, lr=lr)
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=lr)
 
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.belief.to(self.device)
-        self.actor.to(self.device)
-        self.critic1.to(self.device)
-        self.critic2.to(self.device)
-
+    @staticmethod
     def polyak_update(live_model, target_model, tau=0.005):
         with torch.no_grad():
             for live_param, target_param in zip(live_model.parameters(), target_model.parameters()):
@@ -113,20 +107,29 @@ class SACAGent():
                     tau * live_param.data + (1.0 - tau) * target_param.data
                 )
 
-    def act(self, obs):
-        belief = self.belief(self.encoder(obs))
-        return self.actor(belief)
-    
-    def update(self, batch):
-        s, a, r, sp = batch
-        # s is batch by pixel dimensions
-        b = self.belief(self.encoder(s))
-        with torch.no_grad():
-            ap, ap_log_prob = self.act(sp)
-            q_target = r + self.gamma*(torch.min(self.critic1(sp, ap), self.critic2(sp, ap)) - self.alpha*ap_log_prob)
+    @torch.no_grad()
+    def act(self, obs, h=None, deterministic=False):
+        obs = torch.as_tensor(obs, device=self.device)[None, None]  # (1, 1, H, W, 3)
+        b, h = self.belief(self.encoder(obs), h)
+        action, _ = self.actor(b[:, 0], deterministic)
+        return action[0].cpu().numpy(), h
 
-        q_pred1 = self.critic1(torch.concatenate([b, a], dim=1))
-        q_pred2 = self.critic2(torch.concatenate([b, a], dim=1))
+    def update(self, batch):
+        obs, a, r, terminated = (torch.as_tensor(x, device=self.device) for x in batch)
+        a = a.float()
+        r = r.float().unsqueeze(-1)  # (B, T, 1)
+        terminated = terminated.float().unsqueeze(-1)
+
+        beliefs, _ = self.belief(self.encoder(obs))  # (B, T+1, state_dim)
+        b, bp = beliefs[:, :-1], beliefs[:, 1:]
+
+        with torch.no_grad():
+            ap, ap_log_prob = self.actor(bp)
+            q_next = torch.min(self.critic1(bp, ap), self.critic2(bp, ap)) - self.alpha * ap_log_prob # entropy term to reward policy exploration
+            q_target = r + self.gamma * (1 - terminated) * q_next
+
+        q_pred1 = self.critic1(b, a)
+        q_pred2 = self.critic2(b, a)
         q_loss1 = F.mse_loss(q_pred1, q_target)
         q_loss2 = F.mse_loss(q_pred2, q_target)
         total_critic_loss = q_loss1 + q_loss2
@@ -134,10 +137,9 @@ class SACAGent():
         total_critic_loss.backward()
         self.critic_optimizer.step()
 
-        a_pred, a_log_prob = self.act(s) 
-        q_act_pred1 = self.critic1(torch.concatenate([b, a_pred], dim=1))
-        q_act_pred2 = self.critic2(torch.concatenate([b, a_pred], dim=1))
-        actor_loss = (self.alpha * a_log_prob - torch.min(q_act_pred1, q_act_pred2)).mean()
+        b = b.detach()
+        a_pred, a_log_prob = self.actor(b)
+        actor_loss = (self.alpha * a_log_prob - torch.min(self.critic1(b, a_pred), self.critic2(b, a_pred))).mean() # actor loss with reparameterization trick
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
         self.actor_optimizer.step()
