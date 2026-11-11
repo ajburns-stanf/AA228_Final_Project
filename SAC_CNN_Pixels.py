@@ -60,7 +60,9 @@ class Actor(nn.Module):
         dist = Normal(means, torch.exp(log_stds))
         raw_actions = means if deterministic else dist.rsample()
         actions = torch.tanh(raw_actions)
-        log_prob = dist.log_prob(raw_actions) - torch.log(1 - actions.pow(2) + 1e-6)
+        # Stable form of log(1 - tanh(raw_actions)**2).
+        correction = 2 * (0.6931471805599453 - raw_actions - F.softplus(-2 * raw_actions))
+        log_prob = dist.log_prob(raw_actions) - correction
         log_prob = log_prob.sum(dim=-1, keepdim=True)
         return actions, log_prob
 
@@ -82,7 +84,12 @@ class Critic(nn.Module):
 
 class SACAgent:
     def __init__(self, state_dim=128, action_dim=2, gamma=0.99, alpha=0.2, lr=3e-4):
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if torch.cuda.is_available():
+            self.device = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            self.device = torch.device("mps")
+        else:
+            self.device = torch.device("cpu")
         self.encoder = CNNEncoder(state_dim).to(self.device)
         self.belief = nn.GRU(state_dim, state_dim, batch_first=True).to(self.device)
         self.actor = Actor(state_dim, action_dim).to(self.device)
