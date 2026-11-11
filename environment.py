@@ -1,6 +1,6 @@
 # === Create Swappable Env between SAC on State and SAC on Image ===
 """obs="state" and obs="pixels" build the same race, actions, reward. Only the observation type differs.
-- Action (both obs types):  [acceleration 0..1, steer -1..1]
+- Action (both obs types):  [acceleration 0..1, steer -1..1, brake, drift, nitro, fire] (on/off 0..1, pressed above 0.5)
 - obs="state":              18 floats (listed in KartEnv._state)
 - obs="pixels":             camera frame, uint8 array of shape (height, width, 3)"""
 
@@ -19,6 +19,7 @@ FRAME_SIZE = (128, 96)  # (width, height) of the pixel observation
 MAX_STEPS = 1500  # steps before a run is cut off
 STUCK_STEPS = 30  # steps without progress before a run is cut off
 N_LOOKAHEAD = 5  # upcoming points in the state
+PRESS_THRESHOLD = 0.5  # brake, drift, nitro and fire count as pressed above this value
 
 
 def rotation(q):
@@ -65,8 +66,9 @@ class KartEnv(gym.Env):
 
         # -- Initialize Action Space --
         self.action_space = gym.spaces.Box(
-            low=np.array([0, -1], np.float32), high=np.array([1, 1], np.float32)
-        )  # action: [acceleration 0..1, steer -1..1]
+            low=np.array([0, -1, 0, 0, 0, 0], np.float32),
+            high=np.array([1, 1, 1, 1, 1, 1], np.float32),
+        )  # action: [acceleration 0..1, steer -1..1, brake, drift, nitro, fire] (on/off 0..1)
 
         # -- Initialize Observation Space --
         if self.obs == "state":
@@ -134,8 +136,18 @@ class KartEnv(gym.Env):
     def step(self, action):
         """Take a step in the environment with the given action. Then return info needed for SAC."""
         # -- Take the step and evaluate the world now --
+        brake, drift, nitro, fire = (
+            bool(a > PRESS_THRESHOLD) for a in action[2:6]
+        )  # on/off actions are pressed above PRESS_THRESHOLD
         self.race.step(
-            pystk2.Action(acceleration=float(action[0]), steer=float(action[1]))
+            pystk2.Action(
+                acceleration=float(action[0]),
+                steer=float(action[1]),
+                brake=brake,
+                drift=drift,
+                nitro=nitro,
+                fire=fire,
+            )
         )
         self.world.update()
         kart = self.world.players[0].kart  # Obtain agent state

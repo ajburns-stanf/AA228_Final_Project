@@ -21,10 +21,11 @@ def train(args, env_factory=None):
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     buffer = ReplayBuffer(args.buffer_size, args.sequence_length, args.seed)
-    agent = SACAgent(state_dim=args.embedding_dim, lr=args.lr, alpha=args.alpha,
-                     gamma=args.gamma)
-    args.run_dir.mkdir(parents=True, exist_ok=True)
     env = env_factory('pixels')
+    # Size the agent from the env: accel, steer, brake, drift, nitro, fire.
+    agent = SACAgent(state_dim=args.embedding_dim, action_dim=env.action_space.shape[0],
+                     lr=args.lr, alpha=args.alpha, gamma=args.gamma)
+    args.run_dir.mkdir(parents=True, exist_ok=True)
     step = 0
     try:
         with (args.run_dir / 'episodes.csv').open('w', newline='') as episode_file, \
