@@ -24,7 +24,7 @@ def train(args, env_factory=None):
     agent = SACAgent(state_dim=args.embedding_dim, lr=args.lr, alpha=args.alpha,
                      gamma=args.gamma)
     args.run_dir.mkdir(parents=True, exist_ok=True)
-    env = env_factory('pixels')
+    env = env_factory('pixels', args.difficulty)
     step = 0
     try:
         with (args.run_dir / 'episodes.csv').open('w', newline='') as episode_file, \
@@ -98,6 +98,8 @@ def parse_args(argv=None):
     parser.add_argument('--embedding-dim', type=int, default=128)
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--alpha', type=float, default=0.2)
+    parser.add_argument('--difficulty', type=int, choices=(0, 1, 2), default=2,
+                        help='opponent AI: 0 novice, 1 intermediate, 2 expert')
     parser.add_argument('--gamma', type=float, default=0.99)
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--run-dir', type=Path, default=Path('runs/sac_pixels'))
