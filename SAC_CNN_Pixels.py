@@ -106,14 +106,6 @@ class SACAgent:
         self.critic_optimizer = optim.Adam(critic_params, lr=lr)
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=lr)
 
-    @staticmethod
-    def polyak_update(live_model, target_model, tau=0.005):
-        with torch.no_grad():
-            for live_param, target_param in zip(live_model.parameters(), target_model.parameters()):
-                target_param.data.copy_(
-                    tau * live_param.data + (1.0 - tau) * target_param.data
-                )
-
     @torch.no_grad()
     def act(self, obs, h=None, deterministic=False):
         obs = torch.as_tensor(obs, device=self.device)[None, None]  # (1, 1, H, W, 3)
