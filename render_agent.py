@@ -51,7 +51,7 @@ def drive(checkpoint, seed, deterministic, results):
     env = environment.make_env("pixels")
     agent, trained_steps = load_agent(
         checkpoint, env.action_space.shape[0]
-    )  # 6 actions: accel, steer, brake, drift, nitro, fire
+    )  # 5 actions: accel, steer, brake, drift, nitro
     obs, _ = env.reset(seed=seed)
     hidden, actions, locations = None, [], [kart_location(env)]
     total, done = 0.0, False

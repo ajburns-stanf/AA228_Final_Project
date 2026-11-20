@@ -22,7 +22,7 @@ def train(args, env_factory=None):
     torch.manual_seed(args.seed)
     buffer = ReplayBuffer(args.buffer_size, args.sequence_length, args.seed)
     env = env_factory('pixels', args.difficulty)
-    # Size the agent from the env: accel, steer, brake, drift, nitro, fire.
+    # Size the agent from the env: accel, steer, brake, drift, nitro.
     agent = SACAgent(state_dim=args.embedding_dim, action_dim=env.action_space.shape[0],
                      lr=args.lr, alpha=args.alpha, gamma=args.gamma)
     args.run_dir.mkdir(parents=True, exist_ok=True)
