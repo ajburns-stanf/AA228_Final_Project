@@ -1,11 +1,12 @@
-"""Runs the training plan (TRAINING_PLAN.md): trains each experiment, evaluates it, and summarizes the results.
+"""Runs the training plan (TRAINING_PLAN.md): warm start, sweep, fine-tune, evaluate and summarize.
 - python sweep.py sanity               # reward check: quitting must score below random driving
-- python sweep.py phase1               # hyperparameter sweep: train + evaluate every PHASE1 run
+- python sweep.py bc                   # record the path follower and pretrain the pixel policy (warm start)
+- python sweep.py phase1               # gamma x seeds, each run started from the BC policy
 - python sweep.py summary phase1       # results table (finish rate, win rate, time, recklessness)
-- python sweep.py phase2-train         # retrain FIXED under each reward/physics change
-- python sweep.py phase2-eval          # evaluate the fixed policy, unchanged, under env changes
+- python sweep.py phase2-train         # fine-tune FIXED_POLICY under each reward/physics change
+- python sweep.py phase2-eval          # evaluate FIXED_POLICY, unchanged, under env changes
 - python sweep.py summary phase2
-- Options: --only a,b (just those runs) | --seed N (repeat with another seed) | --races N | --dry-run | --quick
+- Options: --only a,b (just those runs) | --seeds 0,1 | --fixed-policy PATH | --races N | --dry-run | --quick
 - Runs that reached their step count and evaluations that have all their races are skipped, so after a stop
   rerun the same command. A stopped training run restarts from scratch (replay isn't saved)."""
 
@@ -19,26 +20,32 @@ import numpy as np
 
 RUNS = Path("runs")
 
-# === Phase 1: tune how well the agent learns; each run changes one knob from BASE ===
-BASE = {"total_steps": 100_000, "alpha": 0.2, "gamma": 0.99, "sequence_length": 8,
-        "difficulty": 0}  # novice opponent: the only level where a decent driver can win
+# === Warm start: behavior cloning from the path follower (bc_pretrain.py) ===
+BC = {"episodes": 20, "steps": 3000, "noise": 0.3,  # teacher races, pretraining steps, steering noise
+      "dagger_rounds": 3, "dagger_episodes": 5, "dagger_steps": 1000}  # student drives, teacher relabels
+
+# === Phase 1: every run starts from the BC policy and changes gamma; each is repeated for every seed ===
+BASE = {"total_steps": 150_000, "gamma": 0.99,
+        "difficulty": 0,  # novice opponent: the only level where a decent driver can win
+        "critic_warmup": 2000,  # critic-only updates first, so untrained critics can't wreck the BC actor
+        "buffer_size": 30_000}  # room for the ~15k demonstration transitions plus fresh experience
 PHASE1 = {
-    "baseline": {"total_steps": 300_000},  # longer: its 100k/200k/300k checkpoints give the length comparison
-    "alpha_0.05": {"alpha": 0.05},
-    "alpha_0.1": {"alpha": 0.1},
+    "gamma_0.98": {"gamma": 0.98},
+    "gamma_0.99": {},
     "gamma_0.995": {"gamma": 0.995},
-    "gamma_0.998": {"gamma": 0.998},
-    "seq_16": {"sequence_length": 16},
 }
-PHASE1_CHECKPOINTS = {"baseline": [100_000, 200_000, 300_000]}  # other runs: their final (100k) policy
+SEEDS = [0, 1]
+PHASE1_CHECKPOINTS = [50_000, 100_000, 150_000]  # the training-length comparison, from each run's checkpoints
 BASELINES = ["random", "full_throttle"]  # reference policies, evaluated alongside phase 1
 
-# === After phase 1: put the winning settings here (e.g. {**BASE, "alpha": 0.05, "total_steps": 200_000}) ===
-FIXED = {**BASE}
+# === After phase 1: the chosen checkpoint and the settings it was trained with ===
+FIXED_POLICY = None  # e.g. "runs/phase1/gamma_0.99_s0/step_100000.pt"
+FIXED = {**BASE}  # e.g. {**BASE, "gamma": 0.995}
 
-# === Phase 2a: retrain FIXED under each change (how the agent's decisions adapt) ===
+# === Phase 2a: fine-tune FIXED_POLICY under each change (how its decisions adapt) ===
+FINETUNE = {"total_steps": 50_000, "learning_starts": 1000, "critic_warmup": 0}  # critics are already trained
 PHASE2_TRAIN = {
-    "fixed": [],  # FIXED unchanged: the reference every change is compared against
+    "fixed": [],  # fine-tuned with no change: the reference, with the same extra training as every change
     "step_0.01": ["step_penalty=0.01"],  # less time pressure
     "step_0.05": ["step_penalty=0.05"],  # more time pressure
     "offroad_0": ["off_road_factor=0.0"],  # off-road meters worth nothing
@@ -47,7 +54,7 @@ PHASE2_TRAIN = {
     "no_brakes": ["no_brakes=True"],
 }
 
-# === Phase 2b: evaluate the fixed policy unchanged under each change (robustness, no retraining) ===
+# === Phase 2b: evaluate FIXED_POLICY unchanged under each change (robustness, no training) ===
 PHASE2_EVAL = {
     "same": {},
     "expert": {"difficulty": 2},  # note: difficulty also changes our kart's speed
@@ -58,29 +65,33 @@ PHASE2_EVAL = {
     "track_zengarden": {"env": ["track=zengarden"]},
 }
 
+QUICK = {"total_steps": 600, "learning_starts": 300, "buffer_size": 1000, "checkpoint_every": 300,
+         "critic_warmup": 100}  # --quick: tiny runs that only test the pipeline
+QUICK_BC = {"episodes": 2, "steps": 100, "dagger_rounds": 1, "dagger_episodes": 1, "dagger_steps": 50}
+
 
 # === Commands ===
 def run(cmd, dry_run):
-    print("$", " ".join(cmd), flush=True)
+    print("$", " ".join(str(c) for c in cmd), flush=True)
     if not dry_run:
-        subprocess.run(cmd, check=True)
+        subprocess.run([str(c) for c in cmd], check=True)
 
 
-def train_cmd(run_dir, settings, env=(), seed=0, quick=False):
-    settings = {**settings, **({"total_steps": 600} if quick else {})}
-    cmd = [sys.executable, "train.py", "--run-dir", str(run_dir), "--seed", str(seed)]
-    if quick:  # tiny smoke test of the whole pipeline
-        cmd += ["--learning-starts", "300", "--buffer-size", "1000", "--checkpoint-every", "300"]
-    for key, value in settings.items():
-        cmd += [f"--{key.replace('_', '-')}", str(value)]
+def flags(settings):
+    """{'total_steps': 600, 'init_from': path} -> ['--total-steps', 600, '--init-from', path]."""
+    return [item for key, value in settings.items() for item in (f"--{key.replace('_', '-')}", value)]
+
+
+def train_cmd(run_dir, settings, env=(), seed=0):
+    cmd = [sys.executable, "train.py", "--run-dir", run_dir, "--seed", seed, *flags(settings)]
     for option in env:
         cmd += ["--env", option]
-    return cmd, settings["total_steps"]
+    return cmd
 
 
 def eval_cmd(policy, name, out, races, difficulty, env=()):
-    cmd = [sys.executable, "evaluate.py", str(policy), "--name", name, "--out", str(out),
-           "--races", str(races), "--difficulty", str(difficulty)]
+    cmd = [sys.executable, "evaluate.py", policy, "--name", name, "--out", out, "--races", races,
+           "--difficulty", difficulty]
     for option in env:
         cmd += ["--env", option]
     return cmd
@@ -103,54 +114,86 @@ def selected(names, only):
     return [n for n in names if not only or n in only]
 
 
-# === Phases ===
+def root_dir(args):
+    return RUNS / "quick" if args.quick else RUNS
+
+
+def require(path, hint, args):
+    if not Path(path).exists() and not args.dry_run:
+        sys.exit(f"{path} not found: {hint}")
+
+
+# === Steps ===
+def bc(args):
+    root = root_dir(args)
+    out, settings = root / "bc", {**BC, **(QUICK_BC if args.quick else {})}
+    if not (out / "policy.pt").exists():
+        run([sys.executable, "bc_pretrain.py", "--out", out, "--difficulty", BASE["difficulty"],
+             "--check-races", 0, *flags(settings)], args.dry_run)
+    eval_out = root / "eval" / "phase1"  # the BC policy appears in phase 1's summary as a reference
+    if not evaluated(eval_out / "bc.csv", args.races):
+        run(eval_cmd(out / "policy.pt", "bc", eval_out, args.races, BASE["difficulty"]), args.dry_run)
+
+
 def phase1(args):
-    out = RUNS / ("quick" if args.quick else "") / "eval" / "phase1"
+    root = root_dir(args)
+    bc_dir, out = root / "bc", root / "eval" / "phase1"
+    require(bc_dir / "policy.pt", "run `python sweep.py bc` first", args)
     for name in selected(PHASE1, args.only):
-        run_name = name + (f"_s{args.seed}" if args.seed else "")
-        run_dir = RUNS / ("quick" if args.quick else "") / "phase1" / run_name
-        cmd, steps = train_cmd(run_dir, {**BASE, **PHASE1[name]}, seed=args.seed, quick=args.quick)
-        if not trained(run_dir, steps):
-            run(cmd, args.dry_run)
-        checkpoints = [] if args.quick else PHASE1_CHECKPOINTS.get(name, [])
-        targets = [(f"{run_name}@{s // 1000}k", run_dir / f"step_{s:06d}.pt") for s in checkpoints]
-        targets = targets or [(run_name, run_dir / "final.pt")]
-        for label, policy in targets:
-            if not evaluated(out / f"{label}.csv", args.races):
-                run(eval_cmd(policy, label, out, args.races, BASE["difficulty"]), args.dry_run)
+        for seed in args.seeds or SEEDS:
+            run_name, run_dir = f"{name}_s{seed}", root / "phase1" / f"{name}_s{seed}"
+            settings = {**BASE, **PHASE1[name], "init_from": bc_dir / "policy.pt", "demos": bc_dir / "demos.npz",
+                        **(QUICK if args.quick else {})}
+            if not trained(run_dir, settings["total_steps"]):
+                run(train_cmd(run_dir, settings, seed=seed), args.dry_run)
+            steps = [] if args.quick else PHASE1_CHECKPOINTS
+            targets = [(f"{run_name}@{s // 1000}k", run_dir / f"step_{s:06d}.pt") for s in steps]
+            for label, policy in targets or [(run_name, run_dir / "final.pt")]:
+                if not evaluated(out / f"{label}.csv", args.races):
+                    run(eval_cmd(policy, label, out, args.races, BASE["difficulty"]), args.dry_run)
     for baseline in selected(BASELINES, args.only):
         if not evaluated(out / f"{baseline}.csv", args.races):
             run(eval_cmd(baseline, baseline, out, args.races, BASE["difficulty"]), args.dry_run)
 
 
+def fixed_policy(args):
+    policy = args.fixed_policy or FIXED_POLICY
+    if policy is None:
+        if args.dry_run:
+            return "<FIXED_POLICY>"
+        sys.exit("Set FIXED_POLICY in sweep.py (or pass --fixed-policy) to the checkpoint chosen in phase 1")
+    require(policy, "check the FIXED_POLICY path", args)
+    return policy
+
+
 def phase2_train(args):
-    out = RUNS / ("quick" if args.quick else "") / "eval" / "phase2"
+    root, policy = root_dir(args), fixed_policy(args)
+    out = root / "eval" / "phase2"
     for name in selected(PHASE2_TRAIN, args.only):
-        run_name = name + (f"_s{args.seed}" if args.seed else "")
-        run_dir = RUNS / ("quick" if args.quick else "") / "phase2" / run_name
-        cmd, steps = train_cmd(run_dir, FIXED, PHASE2_TRAIN[name], args.seed, args.quick)
-        if not trained(run_dir, steps):
-            run(cmd, args.dry_run)
-        if not evaluated(out / f"{run_name}.csv", args.races):  # evaluated in the setting it was trained in
-            run(eval_cmd(run_dir / "final.pt", run_name, out, args.races, FIXED["difficulty"],
-                         PHASE2_TRAIN[name]), args.dry_run)
+        for seed in args.seeds or [0]:
+            run_name = name + (f"_s{seed}" if seed else "")
+            run_dir = root / "phase2" / run_name
+            settings = {**FIXED, **FINETUNE, "init_from": policy, **(QUICK if args.quick else {}),
+                        "critic_warmup": 0}
+            if not trained(run_dir, settings["total_steps"]):
+                run(train_cmd(run_dir, settings, PHASE2_TRAIN[name], seed), args.dry_run)
+            if not evaluated(out / f"{run_name}.csv", args.races):  # evaluated in the setting it was tuned in
+                run(eval_cmd(run_dir / "final.pt", run_name, out, args.races, FIXED["difficulty"],
+                             PHASE2_TRAIN[name]), args.dry_run)
 
 
 def phase2_eval(args):
-    root = RUNS / ("quick" if args.quick else "")
-    policy, out = root / "phase2" / "fixed" / "final.pt", root / "eval" / "phase2"
-    if not policy.exists() and not args.dry_run:
-        sys.exit(f"{policy} not found: run `python sweep.py phase2-train --only fixed` first")
+    root, policy = root_dir(args), fixed_policy(args)
+    out = root / "eval" / "phase2"
     for name in selected(PHASE2_EVAL, args.only):
-        change = PHASE2_EVAL[name]
-        label = f"fixed_on_{name}"
+        change, label = PHASE2_EVAL[name], f"fixed_on_{name}"
         if not evaluated(out / f"{label}.csv", args.races):
             run(eval_cmd(policy, label, out, args.races, change.get("difficulty", FIXED["difficulty"]),
                          change.get("env", [])), args.dry_run)
 
 
 def summary(args):
-    eval_dir = RUNS / ("quick" if args.quick else "") / "eval" / args.phase
+    eval_dir = root_dir(args) / "eval" / args.phase
     metrics = ["finished", "won", "stuck", "finish_time", "mean_speed", "offroad_frac", "steer_jerk",
                "mean_yaw_rate", "crashes"]
     rows = []
@@ -211,19 +254,21 @@ def sanity(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("command", choices=["sanity", "phase1", "phase2-train", "phase2-eval", "summary"])
+    parser.add_argument("command", choices=["sanity", "bc", "phase1", "phase2-train", "phase2-eval", "summary"])
     parser.add_argument("phase", nargs="?", choices=["phase1", "phase2"], help="for summary")
     parser.add_argument("--only", type=lambda s: set(s.split(",")), default=None, help="comma-separated run names")
-    parser.add_argument("--seed", type=int, default=0, help="training seed; nonzero adds _s<seed> to run names")
-    parser.add_argument("--races", type=int, default=None, help="races per evaluation (default 50, --quick 1)")
+    parser.add_argument("--seeds", type=lambda s: [int(x) for x in s.split(",")], default=None,
+                        help="training seeds (default: phase 1 uses SEEDS, phase 2 uses 0)")
+    parser.add_argument("--fixed-policy", default=None, help="overrides FIXED_POLICY for phase 2")
+    parser.add_argument("--races", type=int, default=None, help="races per evaluation (default 20, --quick 1)")
     parser.add_argument("--env", action="append", default=[], metavar="KEY=VALUE", help="for sanity")
     parser.add_argument("--dry-run", action="store_true", help="print the commands without running them")
     parser.add_argument("--quick", action="store_true", help="tiny runs under runs/quick/ to test the pipeline")
     args = parser.parse_args()
-    args.races = args.races or (1 if args.quick else 50)
+    args.races = args.races or (1 if args.quick else 20)
     if args.command == "summary" and not args.phase:
         parser.error("summary needs a phase: python sweep.py summary phase1")
-    {"sanity": sanity, "phase1": phase1, "phase2-train": phase2_train,
+    {"sanity": sanity, "bc": bc, "phase1": phase1, "phase2-train": phase2_train,
      "phase2-eval": phase2_eval, "summary": summary}[args.command](args)
 
 
