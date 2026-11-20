@@ -29,15 +29,40 @@ def parse_env_options(pairs):
     return options
 
 
+AGENT_MODULES = ('encoder', 'belief', 'actor', 'critic1', 'critic2', 'critic1_target', 'critic2_target')
+
+
 def save_checkpoint(path, agent, args, step):
-    """Save weights, optimizers, step and settings (replay isn't saved)."""
+    """Save weights, optimizers, alpha, step and settings (replay isn't saved)."""
     config = {**vars(args), 'run_dir': str(args.run_dir)}
-    # SACAgent is a plain class, so save its five modules individually.
-    models = {name: getattr(agent, name).state_dict() for name in
-              ('encoder', 'belief', 'actor', 'critic1', 'critic2')}
-    torch.save({'step': step, 'config': config, 'agent': models,
+    # SACAgent is a plain class, so save its modules individually.
+    models = {name: getattr(agent, name).state_dict() for name in AGENT_MODULES}
+    torch.save({'step': step, 'config': config, 'agent': models, 'log_alpha': agent.log_alpha.item(),
                 'actor_optimizer': agent.actor_optimizer.state_dict(),
                 'critic_optimizer': agent.critic_optimizer.state_dict()}, path)
+
+
+def load_weights(agent, path):
+    """Start from a checkpoint's networks. A behavior-cloning policy has no critics; those start fresh."""
+    checkpoint = torch.load(path, map_location=agent.device, weights_only=False)
+    for name, weights in checkpoint['agent'].items():
+        getattr(agent, name).load_state_dict(weights)
+    for live, target in (('critic1', 'critic1_target'), ('critic2', 'critic2_target')):
+        if target not in checkpoint['agent']:  # older checkpoints: targets start equal to the critics
+            getattr(agent, target).load_state_dict(getattr(agent, live).state_dict())
+    if 'log_alpha' in checkpoint and agent.auto_alpha:
+        agent.log_alpha.data.fill_(checkpoint['log_alpha'])
+    return sorted(checkpoint['agent'])
+
+
+def preload_demos(buffer, path):
+    """Put recorded demonstrations (bc_pretrain.py's demos.npz) in the replay buffer before training."""
+    demos = np.load(path)
+    frames, obs_ix, next_ix = demos['frames'], demos['obs_ix'], demos['next_ix']
+    for i in range(len(obs_ix)):
+        buffer.add(frames[obs_ix[i]], demos['actions'][i], demos['rewards'][i], frames[next_ix[i]],
+                   bool(demos['terminated'][i]), bool(demos['truncated'][i]))
+    return len(obs_ix)
 
 
 def train(args, env_factory=None):
@@ -50,9 +75,15 @@ def train(args, env_factory=None):
     env = env_factory('pixels', args.difficulty, **parse_env_options(args.env))
     # Size the agent from the env: accel, steer, brake, drift, nitro.
     agent = SACAgent(state_dim=args.embedding_dim, action_dim=env.action_space.shape[0],
-                     lr=args.lr, alpha=args.alpha, gamma=args.gamma)
+                     lr=args.lr, alpha=args.alpha, gamma=args.gamma, auto_alpha=not args.fixed_alpha,
+                     tau=args.tau, augment=not args.no_augment)
+    # Optionally start from a checkpoint (e.g. the behavior-cloning policy) and with demonstrations in replay.
+    if args.init_from:
+        print(f'Starting from {args.init_from}: {", ".join(load_weights(agent, args.init_from))}', flush=True)
+    if args.demos:
+        print(f'Preloaded {preload_demos(buffer, args.demos)} demonstration transitions', flush=True)
     args.run_dir.mkdir(parents=True, exist_ok=True)
-    step = 0
+    step = n_updates = 0
     try:
         with (args.run_dir / 'episodes.csv').open('w', newline='') as episode_file, \
              (args.run_dir / 'updates.csv').open('w', newline='') as update_file:
@@ -60,7 +91,7 @@ def train(args, env_factory=None):
             updates = csv.writer(update_file)
             episodes.writerow(['step', 'episode', 'return', 'length', 'distance', 'terminated', 'truncated',
                                'finished', 'stuck'])
-            updates.writerow(['step', 'critic_loss', 'actor_loss', 'q1_mean', 'q2_mean'])
+            updates.writerow(['step', 'critic_loss', 'actor_loss', 'q1_mean', 'q2_mean', 'alpha', 'log_prob'])
             # 1. Reset starts a race and returns its first raw RGB screenshot.
             obs, _ = env.reset(seed=args.seed)
             hidden = None
@@ -84,9 +115,13 @@ def train(args, env_factory=None):
                         batch = buffer.sample(args.batch_size)
                         if batch is None:
                             break
-                        metrics = agent.update(batch)
+                        # The first --critic-warmup updates train only the critics, so an untrained
+                        # critic can't pull a pretrained actor off course.
+                        metrics = agent.update(batch, update_actor=n_updates >= args.critic_warmup)
+                        n_updates += 1
                         updates.writerow([step, metrics['loss/critic'], metrics['loss/actor'],
-                                          metrics['train/q1_mean'], metrics['train/q2_mean']])
+                                          metrics['train/q1_mean'], metrics['train/q2_mean'],
+                                          metrics['train/alpha'], metrics['train/entropy_log_prob']])
                     update_file.flush()
 
                 # Save a checkpoint every --checkpoint-every steps, so one long run covers several lengths.
@@ -123,7 +158,15 @@ def parse_args(argv=None):
     parser.add_argument('--updates-per-step', type=int, default=1)
     parser.add_argument('--embedding-dim', type=int, default=128)
     parser.add_argument('--lr', type=float, default=3e-4)
-    parser.add_argument('--alpha', type=float, default=0.2)
+    parser.add_argument('--alpha', type=float, default=0.2, help='starting alpha (learned unless --fixed-alpha)')
+    parser.add_argument('--fixed-alpha', action='store_true', help='keep alpha constant instead of tuning it')
+    parser.add_argument('--tau', type=float, default=0.005, help='target critic update rate')
+    parser.add_argument('--no-augment', action='store_true', help='turn off random-shift image augmentation')
+    parser.add_argument('--init-from', type=Path, default=None,
+                        help='start from this checkpoint (e.g. runs/bc/policy.pt or a phase 1 policy)')
+    parser.add_argument('--demos', type=Path, default=None, help='preload these demonstrations into replay')
+    parser.add_argument('--critic-warmup', type=int, default=0,
+                        help='first N updates train only the critics (use with --init-from)')
     parser.add_argument('--difficulty', type=int, choices=(0, 1, 2), default=2,
                         help='opponent AI: 0 novice, 1 intermediate, 2 expert')
     parser.add_argument('--gamma', type=float, default=0.99)
@@ -142,8 +185,11 @@ def parse_args(argv=None):
         parser.error('--buffer-size must cover learning-starts, batch-size and sequence-length')
     if args.lr <= 0 or args.alpha < 0 or not 0 <= args.gamma <= 1:
         parser.error('Require lr > 0, alpha >= 0, and gamma in [0, 1]')
-    if args.checkpoint_every < 0:
-        parser.error('--checkpoint-every must be 0 or positive')
+    if args.checkpoint_every < 0 or args.critic_warmup < 0 or not 0 < args.tau <= 1:
+        parser.error('Require --checkpoint-every >= 0, --critic-warmup >= 0 and 0 < --tau <= 1')
+    for path in (args.init_from, args.demos):
+        if path is not None and not path.exists():
+            parser.error(f'{path} not found')
     try:
         parse_env_options(args.env)
     except ValueError as error:
