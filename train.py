@@ -21,7 +21,7 @@ def train(args, env_factory=None):
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     buffer = ReplayBuffer(args.buffer_size, args.sequence_length, args.seed)
-    env = env_factory('pixels')
+    env = env_factory('pixels', args.difficulty)
     # Size the agent from the env: accel, steer, brake, drift, nitro, fire.
     agent = SACAgent(state_dim=args.embedding_dim, action_dim=env.action_space.shape[0],
                      lr=args.lr, alpha=args.alpha, gamma=args.gamma)
@@ -99,6 +99,8 @@ def parse_args(argv=None):
     parser.add_argument('--embedding-dim', type=int, default=128)
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--alpha', type=float, default=0.2)
+    parser.add_argument('--difficulty', type=int, choices=(0, 1, 2), default=2,
+                        help='opponent AI: 0 novice, 1 intermediate, 2 expert')
     parser.add_argument('--gamma', type=float, default=0.99)
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--run-dir', type=Path, default=Path('runs/sac_pixels'))

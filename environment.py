@@ -14,12 +14,21 @@ import pystk2
 
 # === Definitions ===
 TRACK = "lighthouse"
+DIFFICULTY = 2  # opponent AI: 0 novice, 1 intermediate, 2 expert (STK default)
 N_KARTS = 2  # total karts
 FRAME_SIZE = (128, 96)  # (width, height) of the pixel observation
 MAX_STEPS = 1500  # steps before a run is cut off
 STUCK_STEPS = 30  # steps without progress before a run is cut off
 N_LOOKAHEAD = 5  # upcoming points in the state
 PRESS_THRESHOLD = 0.5  # brake, drift, nitro and fire count as pressed above this value
+
+# -- Reward weights --
+PROGRESS_REWARD = 0.1  # per meter gained along the track
+STEP_PENALTY = 0.03  # per step: pushes the agent to finish faster
+OFF_ROAD_PENALTY = 0.1  # per step spent off the road
+LEAD_REWARD = 0.02  # per step spent in 1st place
+FINISH_BONUS = 5.0  # for finishing the race in any position
+WIN_BONUS = 15.0  # extra for finishing in 1st place
 
 
 def rotation(q):
@@ -49,9 +58,10 @@ def rotation(q):
 
 # === Environment ===
 class KartEnv(gym.Env):
-    def __init__(self, obs_type):
+    def __init__(self, obs_type, difficulty=DIFFICULTY):
         """Initialize the kart enviornment/SAC parameters."""
         self.obs = obs_type
+        self.difficulty = difficulty
         self.race = None
 
         # -- Setup Graphics Depending on Observation Type --
@@ -91,6 +101,7 @@ class KartEnv(gym.Env):
         config = pystk2.RaceConfig()
         config.num_kart = N_KARTS  # total karts
         config.track = TRACK  # specify track
+        config.difficulty = self.difficulty  # opponent AI skill
         config.laps = 1  # one lap per run (STK's default is 3)
         config.seed = int(
             self.np_random.integers(2**16)
@@ -153,15 +164,22 @@ class KartEnv(gym.Env):
         kart = self.world.players[0].kart  # Obtain agent state
         self.steps += 1  # Increment step counter
 
-        # -- Compute Reward: 0.1 per meter gained, -0.01 per step, -0.1 off-road, +10 for finishing --
+        # -- Compute Reward: progress, time, off-road, being in the lead, finishing, winning --
         distance = self._distance()  # Compute distance along track
         progress = distance - self.distance  # Compute progress since last step
         self.distance = distance  # store for next step to track progress
 
         on_road = kart.is_on_road  # Check if kart is on the road
         finished = kart.has_finished_race  # Check if kart has finished the race
+        leading = kart.position == 1  # race rank, updated live (1 = first)
 
-        reward = 0.1 * progress - 0.01 - 0.1 * (not on_road) + 10 * finished
+        reward = (
+            PROGRESS_REWARD * progress
+            - STEP_PENALTY
+            - OFF_ROAD_PENALTY * (not on_road)
+            + LEAD_REWARD * leading
+            + (FINISH_BONUS + WIN_BONUS * leading) * finished
+        )
 
         # -- Check if run should be stopped due to being stuck or exceeding max steps --
         self.stuck = (
@@ -171,13 +189,17 @@ class KartEnv(gym.Env):
             self.stuck >= STUCK_STEPS or self.steps >= MAX_STEPS
         )  # boolean true/false to signal that run has been stopped early
 
-        # -- Return current observation, reward, finished status, truncated status, and additional info (distance) --
+        # -- Return current observation, reward, finished status, truncated status, and additional info --
         return (
             self._obs(),
             float(reward),
             bool(finished),
             truncated,
-            {"distance": distance},
+            {
+                "distance": distance,
+                "position": kart.position,
+                "finish_time": kart.finish_time if finished else None,
+            },
         )
 
     def _distance(self):
@@ -254,6 +276,6 @@ class KartEnv(gym.Env):
         pystk2.clean()
 
 
-def make_env(obs="state"):
+def make_env(obs="state", difficulty=DIFFICULTY):
     """Entry point for the training scripts"""
-    return KartEnv(obs)
+    return KartEnv(obs, difficulty)
