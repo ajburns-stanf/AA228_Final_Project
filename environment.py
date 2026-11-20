@@ -2,9 +2,12 @@
 """obs="state" and obs="pixels" build the same race, actions, reward. Only the observation type differs.
 - Action (both obs types):  [acceleration 0..1, steer -1..1, brake, drift, nitro] (on/off 0..1, pressed above 0.5)
 - obs="state":              18 floats (listed in KartEnv._state)
-- obs="pixels":             camera frame, uint8 array of shape (height, width, 3)"""
+- obs="pixels":             camera frame, uint8 array of shape (height, width, 3)
+- Experiments change settings by name: make_env("pixels", 2, step_penalty=0.05, track="zengarden") (see DEFAULT_OPTIONS)"""
 
 # === Imports ===
+from collections import deque
+
 from stk_setup import setup
 
 setup()  # ensure DLL is properly imported for windows
@@ -25,10 +28,28 @@ PRESS_THRESHOLD = 0.5  # brake, drift and nitro count as pressed above this valu
 # -- Reward weights --
 PROGRESS_REWARD = 0.1  # per meter gained along the track
 STEP_PENALTY = 0.03  # per step: pushes the agent to finish faster
-OFF_ROAD_PENALTY = 0.1  # per step spent off the road
+OFF_ROAD_FACTOR = 0.5  # off-road meters count this much: worse than the road, never worse than stopping
 LEAD_REWARD = 0.02  # per step spent in 1st place
 FINISH_BONUS = 5.0  # for finishing the race in any position
 WIN_BONUS = 15.0  # extra for finishing in 1st place
+STUCK_PENALTY = 10.0  # getting stuck ends the run as a failure, so quitting never beats trying
+
+# -- Settings experiments can change by name (make_env(..., key=value) or train.py/evaluate.py --env key=value) --
+DEFAULT_OPTIONS = {
+    "track": TRACK,
+    "n_karts": N_KARTS,
+    "kart": "",  # our kart model, e.g. "gnu"; "" = STK's default (tux)
+    "progress_reward": PROGRESS_REWARD,
+    "step_penalty": STEP_PENALTY,
+    "off_road_factor": OFF_ROAD_FACTOR,
+    "lead_reward": LEAD_REWARD,
+    "finish_bonus": FINISH_BONUS,
+    "win_bonus": WIN_BONUS,
+    "stuck_penalty": STUCK_PENALTY,
+    "action_noise": 0.0,  # std of Gaussian noise added to acceleration and steer
+    "action_delay": 0,  # steps between choosing an action and it reaching the kart
+    "no_brakes": False,  # ignore the brake action
+}
 
 
 def rotation(q):
@@ -58,11 +79,17 @@ def rotation(q):
 
 # === Environment ===
 class KartEnv(gym.Env):
-    def __init__(self, obs_type, difficulty=DIFFICULTY):
+    def __init__(self, obs_type, difficulty=DIFFICULTY, **options):
         """Initialize the kart enviornment/SAC parameters."""
         self.obs = obs_type
         self.difficulty = difficulty
         self.race = None
+
+        # -- Experiment Settings: defaults, overridden by name --
+        unknown = sorted(set(options) - set(DEFAULT_OPTIONS))
+        if unknown:
+            raise ValueError(f"Unknown env options {unknown}; valid: {sorted(DEFAULT_OPTIONS)}")
+        self.opt = {**DEFAULT_OPTIONS, **options}
 
         # -- Setup Graphics Depending on Observation Type --
         if self.obs == "state":
@@ -99,8 +126,8 @@ class KartEnv(gym.Env):
 
         # -- Setup Race Configuration --
         config = pystk2.RaceConfig()
-        config.num_kart = N_KARTS  # total karts
-        config.track = TRACK  # specify track
+        config.num_kart = self.opt["n_karts"]  # total karts
+        config.track = self.opt["track"]  # specify track
         config.difficulty = self.difficulty  # opponent AI skill
         config.laps = 1  # one lap per run (STK's default is 3)
         config.seed = int(
@@ -114,9 +141,11 @@ class KartEnv(gym.Env):
             if self.obs == "pixels"
             else pystk2.PlayerConfig.CameraMode.OFF
         )
+        if self.opt["kart"]:
+            config.players[0].kart = self.opt["kart"]  # kart model, e.g. "gnu"
 
         # Add Opponent Karts (AI Controlled)
-        for _ in range(N_KARTS - 1):
+        for _ in range(self.opt["n_karts"] - 1):
             opponent = pystk2.PlayerConfig()
             opponent.controller = pystk2.PlayerConfig.Controller.AI_CONTROL
             opponent.camera_mode = pystk2.PlayerConfig.CameraMode.OFF
@@ -142,14 +171,27 @@ class KartEnv(gym.Env):
 
         self.distance = self._distance()
         self.steps = self.stuck = 0
+        self.pending = deque(
+            [np.zeros(5, np.float32)] * self.opt["action_delay"]
+        )  # delayed actions waiting to reach the kart (no throttle at first)
         return self._obs(), {}
 
     def step(self, action):
         """Take a step in the environment with the given action. Then return info needed for SAC."""
+        # -- Perturb the Controls if the Experiment Asks: noise, delay, no brakes --
+        action = np.array(action, dtype=np.float32)
+        if self.opt["action_noise"] > 0:
+            action[:2] += self.np_random.normal(0, self.opt["action_noise"], 2)
+            action = np.clip(action, self.action_space.low, self.action_space.high)
+        if self.opt["action_delay"] > 0:
+            self.pending.append(action)
+            action = self.pending.popleft()  # the action chosen action_delay steps ago
+
         # -- Take the step and evaluate the world now --
         brake, drift, nitro = (
             bool(a > PRESS_THRESHOLD) for a in action[2:5]
         )  # on/off actions are pressed above PRESS_THRESHOLD
+        brake = brake and not self.opt["no_brakes"]
         self.race.step(
             pystk2.Action(
                 acceleration=float(action[0]),
@@ -163,7 +205,7 @@ class KartEnv(gym.Env):
         kart = self.world.players[0].kart  # Obtain agent state
         self.steps += 1  # Increment step counter
 
-        # -- Compute Reward: progress, time, off-road, being in the lead, finishing, winning --
+        # -- Compute Reward: progress (less off-road), time, being in the lead, finishing, winning --
         distance = self._distance()  # Compute distance along track
         progress = distance - self.distance  # Compute progress since last step
         self.distance = distance  # store for next step to track progress
@@ -172,32 +214,40 @@ class KartEnv(gym.Env):
         finished = kart.has_finished_race  # Check if kart has finished the race
         leading = kart.position == 1  # race rank, updated live (1 = first)
 
+        progress_reward = self.opt["progress_reward"] * progress
+        if progress > 0 and not on_road:
+            progress_reward *= self.opt["off_road_factor"]  # forward meters off the road count less
         reward = (
-            PROGRESS_REWARD * progress
-            - STEP_PENALTY
-            - OFF_ROAD_PENALTY * (not on_road)
-            + LEAD_REWARD * leading
-            + (FINISH_BONUS + WIN_BONUS * leading) * finished
+            progress_reward
+            - self.opt["step_penalty"]
+            + self.opt["lead_reward"] * leading
+            + (self.opt["finish_bonus"] + self.opt["win_bonus"] * leading) * finished
         )
 
         # -- Check if run should be stopped due to being stuck or exceeding max steps --
         self.stuck = (
             self.stuck + 1 if progress < 0.1 else 0
         )  # stuck if distance does not change between current and prior step
+        stuck = self.stuck >= STUCK_STEPS
+        if stuck:
+            reward -= self.opt["stuck_penalty"]  # getting stuck is a failure, never a cheap way out
+        terminated = finished or stuck  # both end the run for good: no future value
         truncated = (
-            self.stuck >= STUCK_STEPS or self.steps >= MAX_STEPS
-        )  # boolean true/false to signal that run has been stopped early
+            not terminated and self.steps >= MAX_STEPS
+        )  # out of time: cut off, but the run still had a future
 
-        # -- Return current observation, reward, finished status, truncated status, and additional info --
+        # -- Return current observation, reward, terminated status, truncated status, and additional info --
         return (
             self._obs(),
             float(reward),
-            bool(finished),
+            bool(terminated),
             truncated,
             {
                 "distance": distance,
                 "position": kart.position,
                 "finish_time": kart.finish_time if finished else None,
+                "finished": bool(finished),  # terminated also covers getting stuck
+                "stuck": stuck,
             },
         )
 
@@ -275,6 +325,6 @@ class KartEnv(gym.Env):
         pystk2.clean()
 
 
-def make_env(obs="state", difficulty=DIFFICULTY):
-    """Entry point for the training scripts"""
-    return KartEnv(obs, difficulty)
+def make_env(obs="state", difficulty=DIFFICULTY, **options):
+    """Entry point for the training scripts (options: see DEFAULT_OPTIONS)"""
+    return KartEnv(obs, difficulty, **options)

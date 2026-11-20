@@ -1,8 +1,9 @@
 """Races a policy on fixed seeds and writes one CSV row per race. Every run uses this script, so all
 results share the same metrics and can be concatenated for the speed vs. recklessness comparison.
-- Usage: python evaluate.py <policy> [--races 50] [--difficulty 2] [--out runs/eval]
+- Usage: python evaluate.py <policy> [--races 50] [--difficulty 2] [--out runs/eval] [--name NAME] [--env KEY=VALUE]
 - <policy> is a checkpoint (runs/<name>/final.pt), or a baseline: "random" or "full_throttle"
-- Output: <out>/<name>.csv"""
+- --env changes env settings for every race (e.g. --env track=zengarden), see environment.DEFAULT_OPTIONS
+- Output: <out>/<name>.csv (name defaults to the checkpoint's folder or the baseline's name)"""
 
 import argparse
 import csv
@@ -13,7 +14,7 @@ import torch
 
 from environment import make_env
 from SAC_CNN_Pixels import SACAgent
-from train import to_env
+from train import parse_env_options, to_env
 
 CRASH_DROP = 5.0
 
@@ -47,11 +48,13 @@ def race(env, policy, seed):
         yaws.append(abs(kart.angular_velocity[1]))
         crashes += speed_prev - kart.speed > CRASH_DROP
         steer_prev, speed_prev = action[1], kart.speed
+    finished = info["finished"]  # terminated also covers getting stuck
     return {
         "seed": seed,
-        "finished": int(terminated),
-        "won": int(terminated and kart.position == 1),
-        "finish_time": kart.finish_time if terminated else "",
+        "finished": int(finished),
+        "won": int(finished and kart.position == 1),
+        "stuck": int(info["stuck"]),
+        "finish_time": kart.finish_time if finished else "",
         "steps": len(speeds),
         "distance": info["distance"],
         "mean_speed": np.mean(speeds),
@@ -68,16 +71,20 @@ def main():
     parser.add_argument("--races", type=int, default=50)
     parser.add_argument("--difficulty", type=int, choices=(0, 1, 2), default=2)
     parser.add_argument("--out", type=Path, default=Path("runs/eval"))
+    parser.add_argument("--name", default=None, help="output CSV name (default: checkpoint folder or baseline)")
+    parser.add_argument("--env", action="append", default=[], metavar="KEY=VALUE",
+                        help="env setting for every race, repeatable, e.g. --env track=zengarden")
     args = parser.parse_args()
 
-    name = Path(args.policy).parent.name if args.policy.endswith(".pt") else args.policy
-    env = make_env("pixels", args.difficulty)
+    name = args.name or (Path(args.policy).parent.name if args.policy.endswith(".pt") else args.policy)
+    env = make_env("pixels", args.difficulty, **parse_env_options(args.env))
     policy = load_policy(args.policy, env.action_space.shape[0])
     args.out.mkdir(parents=True, exist_ok=True)
     rows = []
     try:
         for seed in range(args.races):  # same seeds for every policy for fair comparison
-            rows.append({"run": name, "difficulty": args.difficulty, **race(env, policy, seed)})
+            rows.append({"run": name, "difficulty": args.difficulty, "env": " ".join(args.env),
+                         **race(env, policy, seed)})
             print(rows[-1], flush=True)
     finally:
         env.close()
@@ -87,7 +94,7 @@ def main():
                 writer.writeheader()
                 writer.writerows(rows)
 
-    for key in ("finished", "won", "mean_speed", "offroad_frac", "steer_jerk", "crashes"):
+    for key in ("finished", "won", "stuck", "mean_speed", "offroad_frac", "steer_jerk", "crashes"):
         print(f"{key:>14}: {np.mean([r[key] for r in rows]):.3f}")
 
 

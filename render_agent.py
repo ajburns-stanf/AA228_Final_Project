@@ -64,7 +64,7 @@ def drive(checkpoint, seed, deterministic, results):
         total += reward
         done = terminated or truncated
     results.put({"actions": actions, "locations": locations, "return": total, "distance": info["distance"],
-                 "finished": bool(terminated), "steps": env.steps, "trained_steps": trained_steps})
+                 "finished": info["finished"], "steps": env.steps, "trained_steps": trained_steps})
     env.close()
 
 
