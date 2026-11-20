@@ -1,5 +1,6 @@
 """Collect pixel transitions with SACAgent.act, then train from replay windows."""
 import argparse
+import ast
 import csv
 from pathlib import Path
 import numpy as np
@@ -14,6 +15,31 @@ def to_env(action, action_space):
             (action_space.high - action_space.low)).astype(np.float32)
 
 
+def parse_env_options(pairs):
+    """['step_penalty=0.05', 'track=zengarden'] -> {'step_penalty': 0.05, 'track': 'zengarden'}."""
+    options = {}
+    for pair in pairs:
+        key, sep, value = pair.partition('=')
+        if not sep:
+            raise ValueError(f'--env expects key=value, got {pair!r}')
+        try:
+            options[key] = ast.literal_eval(value)  # numbers, True/False
+        except (ValueError, SyntaxError):
+            options[key] = value  # plain strings, e.g. a track name
+    return options
+
+
+def save_checkpoint(path, agent, args, step):
+    """Save weights, optimizers, step and settings (replay isn't saved)."""
+    config = {**vars(args), 'run_dir': str(args.run_dir)}
+    # SACAgent is a plain class, so save its five modules individually.
+    models = {name: getattr(agent, name).state_dict() for name in
+              ('encoder', 'belief', 'actor', 'critic1', 'critic2')}
+    torch.save({'step': step, 'config': config, 'agent': models,
+                'actor_optimizer': agent.actor_optimizer.state_dict(),
+                'critic_optimizer': agent.critic_optimizer.state_dict()}, path)
+
+
 def train(args, env_factory=None):
     if env_factory is None:
         from environment import make_env
@@ -21,7 +47,7 @@ def train(args, env_factory=None):
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     buffer = ReplayBuffer(args.buffer_size, args.sequence_length, args.seed)
-    env = env_factory('pixels', args.difficulty)
+    env = env_factory('pixels', args.difficulty, **parse_env_options(args.env))
     # Size the agent from the env: accel, steer, brake, drift, nitro.
     agent = SACAgent(state_dim=args.embedding_dim, action_dim=env.action_space.shape[0],
                      lr=args.lr, alpha=args.alpha, gamma=args.gamma)
@@ -32,7 +58,8 @@ def train(args, env_factory=None):
              (args.run_dir / 'updates.csv').open('w', newline='') as update_file:
             episodes = csv.writer(episode_file)
             updates = csv.writer(update_file)
-            episodes.writerow(['step', 'episode', 'return', 'length', 'distance', 'terminated', 'truncated'])
+            episodes.writerow(['step', 'episode', 'return', 'length', 'distance', 'terminated', 'truncated',
+                               'finished', 'stuck'])
             updates.writerow(['step', 'critic_loss', 'actor_loss', 'q1_mean', 'q2_mean'])
             # 1. Reset starts a race and returns its first raw RGB screenshot.
             obs, _ = env.reset(seed=args.seed)
@@ -62,10 +89,15 @@ def train(args, env_factory=None):
                                           metrics['train/q1_mean'], metrics['train/q2_mean']])
                     update_file.flush()
 
+                # Save a checkpoint every --checkpoint-every steps, so one long run covers several lengths.
+                if args.checkpoint_every and step % args.checkpoint_every == 0:
+                    save_checkpoint(args.run_dir / f'step_{step:06d}.pt', agent, args, step)
+
                 if terminated or truncated:
                     episode += 1
                     episodes.writerow([step, episode, episode_return, episode_length,
-                                       info.get('distance', ''), terminated, truncated])
+                                       info.get('distance', ''), terminated, truncated,
+                                       info.get('finished', ''), info.get('stuck', '')])
                     episode_file.flush()
                     print(f'step={step} episode={episode} return={episode_return:.3f} length={episode_length}', flush=True)
                     # 6. Start a new race with no memory from the previous one.
@@ -75,14 +107,7 @@ def train(args, env_factory=None):
     finally:
         try:
             # Save weights and optimizers even when interrupted; replay isn't saved.
-            config = {**vars(args), 'run_dir': str(args.run_dir)}
-            # SACAgent is a plain class, so save its five modules individually.
-            models = {name: getattr(agent, name).state_dict() for name in
-                      ('encoder', 'belief', 'actor', 'critic1', 'critic2')}
-            torch.save({'step': step, 'config': config, 'agent': models,
-                        'actor_optimizer': agent.actor_optimizer.state_dict(),
-                        'critic_optimizer': agent.critic_optimizer.state_dict()},
-                       args.run_dir / 'final.pt')
+            save_checkpoint(args.run_dir / 'final.pt', agent, args, step)
         finally:
             env.close()
     return agent
@@ -104,6 +129,10 @@ def parse_args(argv=None):
     parser.add_argument('--gamma', type=float, default=0.99)
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--run-dir', type=Path, default=Path('runs/sac_pixels'))
+    parser.add_argument('--checkpoint-every', type=int, default=25_000,
+                        help='save step_XXXXXX.pt every N steps (0 = only final.pt)')
+    parser.add_argument('--env', action='append', default=[], metavar='KEY=VALUE',
+                        help='env setting, repeatable, e.g. --env step_penalty=0.05 (see environment.DEFAULT_OPTIONS)')
     args = parser.parse_args(argv)
     for name in ('total_steps', 'learning_starts', 'buffer_size', 'batch_size',
                  'sequence_length', 'updates_per_step', 'embedding_dim'):
@@ -113,6 +142,12 @@ def parse_args(argv=None):
         parser.error('--buffer-size must cover learning-starts, batch-size and sequence-length')
     if args.lr <= 0 or args.alpha < 0 or not 0 <= args.gamma <= 1:
         parser.error('Require lr > 0, alpha >= 0, and gamma in [0, 1]')
+    if args.checkpoint_every < 0:
+        parser.error('--checkpoint-every must be 0 or positive')
+    try:
+        parse_env_options(args.env)
+    except ValueError as error:
+        parser.error(str(error))
     return args
 
 
