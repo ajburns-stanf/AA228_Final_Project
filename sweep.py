@@ -3,15 +3,16 @@
 - python sweep.py bc                   # record the path follower and pretrain the pixel policy (warm start)
 - python sweep.py phase1               # gamma x seeds, each run started from the BC policy
 - python sweep.py summary phase1       # results table (finish rate, win rate, time, recklessness)
-- python sweep.py phase2-train         # fine-tune FIXED_POLICY under each reward/physics change
+- python sweep.py phase2-train         # fine-tune FIXED_POLICY under each reward/physics change, once per seed
 - python sweep.py phase2-eval          # evaluate FIXED_POLICY, unchanged, under env changes
-- python sweep.py summary phase2
+- python sweep.py summary phase2       # one row per run, plus each setting averaged over its seeds
 - Options: --only a,b (just those runs) | --seeds 0,1 | --fixed-policy PATH | --races N | --dry-run | --quick
 - Runs that reached their step count and evaluations that have all their races are skipped, so after a stop
   rerun the same command. A stopped training run restarts from scratch (replay isn't saved)."""
 
 import argparse
 import csv
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -39,8 +40,10 @@ PHASE1_CHECKPOINTS = [50_000, 100_000, 150_000]  # the training-length compariso
 BASELINES = ["random", "full_throttle"]  # reference policies, evaluated alongside phase 1
 
 # === After phase 1: the chosen checkpoint and the settings it was trained with ===
-FIXED_POLICY = None  # e.g. "runs/phase1/gamma_0.99_s0/step_100000.pt"
-FIXED = {**BASE}  # e.g. {**BASE, "gamma": 0.995}
+# γ 0.995: highest finish rate over both seeds (88%) and the only γ with no failing checkpoint (worst 75%).
+# 100k: as good as 50k/150k on finishing, best on winning. Seed 1: 90% finished, 75% won, 10% stuck.
+FIXED_POLICY = "runs/phase1/gamma_0.995_s1/step_100000.pt"
+FIXED = {**BASE, "gamma": 0.995}
 
 # === Phase 2a: fine-tune FIXED_POLICY under each change (how its decisions adapt) ===
 FINETUNE = {"total_steps": 50_000, "learning_starts": 1000, "critic_warmup": 0}  # critics are already trained
@@ -50,17 +53,28 @@ PHASE2_TRAIN = {
     "step_0.05": ["step_penalty=0.05"],  # more time pressure
     "offroad_0": ["off_road_factor=0.0"],  # off-road meters worth nothing
     "offroad_1": ["off_road_factor=1.0"],  # off-road as good as the road
+    "win_0": ["win_bonus=0"],  # winning earns nothing beyond finishing
     "win_45": ["win_bonus=45"],  # winning matters 3x more
+    "stuck_30": ["stuck_penalty=30"],  # failing (getting stuck) costs 3x more
     "no_brakes": ["no_brakes=True"],
 }
+PHASE2_SEEDS = [0, 1, 2]  # every change, and fixed, is fine-tuned once per seed: the spread is fine-tuning luck
 
 # === Phase 2b: evaluate FIXED_POLICY unchanged under each change (robustness, no training) ===
+# Several strengths of the same change give a curve (e.g. finish rate vs. noise) instead of one point.
 PHASE2_EVAL = {
     "same": {},
-    "expert": {"difficulty": 2},  # note: difficulty also changes our kart's speed
+    "intermediate": {"difficulty": 1},  # note: difficulty also changes our kart's speed
+    "expert": {"difficulty": 2},
+    "karts_3": {"env": ["n_karts=3"]},  # opponents: 2, 3 and 5 instead of 1
     "karts_4": {"env": ["n_karts=4"]},
+    "karts_6": {"env": ["n_karts=6"]},
+    "noise_0.1": {"env": ["action_noise=0.1"]},
     "noise_0.2": {"env": ["action_noise=0.2"]},
+    "noise_0.4": {"env": ["action_noise=0.4"]},
+    "delay_1": {"env": ["action_delay=1"]},
     "delay_2": {"env": ["action_delay=2"]},
+    "delay_4": {"env": ["action_delay=4"]},
     "kart_gnu": {"env": ["kart=gnu"]},
     "track_zengarden": {"env": ["track=zengarden"]},
 }
@@ -169,9 +183,9 @@ def fixed_policy(args):
 def phase2_train(args):
     root, policy = root_dir(args), fixed_policy(args)
     out = root / "eval" / "phase2"
-    for name in selected(PHASE2_TRAIN, args.only):
-        for seed in args.seeds or [0]:
-            run_name = name + (f"_s{seed}" if seed else "")
+    for seed in args.seeds or PHASE2_SEEDS:  # one seed at a time, so a stopped sweep leaves whole seeds done
+        for name in selected(PHASE2_TRAIN, args.only):
+            run_name = f"{name}_s{seed}"
             run_dir = root / "phase2" / run_name
             settings = {**FIXED, **FINETUNE, "init_from": policy, **(QUICK if args.quick else {}),
                         "critic_warmup": 0}
@@ -192,34 +206,86 @@ def phase2_eval(args):
                          change.get("env", [])), args.dry_run)
 
 
-def summary(args):
-    eval_dir = root_dir(args) / "eval" / args.phase
-    metrics = ["finished", "won", "stuck", "finish_time", "mean_speed", "offroad_frac", "steer_jerk",
-               "mean_yaw_rate", "crashes"]
-    rows = []
-    for path in sorted(eval_dir.glob("*.csv")):
-        if path.name == "summary.csv":
-            continue
-        races = list(csv.DictReader(path.open()))
-        row = {"run": path.stem, "races": len(races)}
-        for key in metrics:
-            values = [float(r[key]) for r in races if r.get(key) not in ("", None, "None")]
-            row[key] = round(float(np.mean(values)), 3) if values else ""
-        rows.append(row)
-    if not rows:
-        sys.exit(f"No results in {eval_dir}")
-    rows.sort(key=lambda r: (-r["finished"], r["finish_time"] if r["finish_time"] != "" else 1e9))
-    with (eval_dir / "summary.csv").open("w", newline="") as f:
+# -- Summary tables --
+METRICS = ["finished", "won", "stuck", "finish_time", "mean_speed", "offroad_frac", "steer_jerk", "mean_yaw_rate",
+           "crashes", "brake_frac", "drift_frac", "nitro_frac"]
+COLUMNS = [("finish", "finished", "{:.0%}"), ("win", "won", "{:.0%}"), ("stuck", "stuck", "{:.0%}"),
+           ("time s", "finish_time", "{:.1f}"), ("speed", "mean_speed", "{:.1f}"),
+           ("offroad", "offroad_frac", "{:.0%}"), ("jerk", "steer_jerk", "{:.2f}"), ("crash", "crashes", "{:.1f}"),
+           ("brake", "brake_frac", "{:.0%}"), ("drift", "drift_frac", "{:.0%}"),
+           ("nitro", "nitro_frac", "{:.0%}")]  # (header, metric, format) of the printed tables
+SEED_SUFFIX = re.compile(r"_s\d+(?=@|$)")  # fixed_s2 -> fixed, gamma_0.99_s1@100k -> gamma_0.99@100k
+
+
+def mean_or_blank(values):
+    return round(float(np.mean(values)), 3) if values else ""
+
+
+def by_finish(row):
+    """Sort key: finish rate first (high to low), then finish time (fast to slow)."""
+    return -row["finished"], row["finish_time"] if row["finish_time"] != "" else 1e9
+
+
+def write_rows(path, rows):
+    with path.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=rows[0].keys())
         writer.writeheader()
         writer.writerows(rows)
-    print(f"{'run':28s} {'races':>5s} {'finish':>7s} {'win':>6s} {'stuck':>6s} {'time s':>7s} {'speed':>6s} "
-          f"{'offroad':>8s} {'jerk':>6s} {'crash':>6s}")
+
+
+def print_table(rows, name, count, spread=False):
+    """Aligned columns; with spread, each value is mean±std over seeds. Missing metrics print as -."""
+    width, name_width = (10 if spread else 8), max(len(r[name]) for r in rows) + 2
+    print(f"{name:{name_width}s}{count:>5s}" + "".join(f"{header:>{width}s}" for header, _, _ in COLUMNS))
     for r in rows:
-        print(f"{r['run']:28s} {r['races']:5d} {r['finished']:7.0%} {r['won']:6.0%} {r['stuck']:6.0%} "
-              f"{r['finish_time'] if r['finish_time'] != '' else '-':>7} {r['mean_speed']:6.1f} "
-              f"{r['offroad_frac']:8.0%} {r['steer_jerk']:6.3f} {r['crashes']:6.1f}")
-    print(f"\nSaved {eval_dir / 'summary.csv'} (sorted by finish rate, then finish time)")
+        cells = ""
+        for _, key, spec in COLUMNS:
+            cell = spec.format(r[key]) if r[key] != "" else "-"
+            if spread and r[f"{key}_std"] != "":
+                cell += "±" + spec.format(r[f"{key}_std"]).rstrip("%")
+            cells += f"{cell:>{width}s}"
+        print(f"{r[name]:{name_width}s}{r[count]:5d}" + cells)
+
+
+def summary(args):
+    eval_dir = root_dir(args) / "eval" / args.phase
+    rows = []
+    for path in sorted(eval_dir.glob("*.csv")):
+        if path.name.startswith("summary"):
+            continue
+        races = list(csv.DictReader(path.open()))
+        row = {"run": path.stem, "races": len(races)}
+        for key in METRICS:  # older CSVs may lack newer metrics; those stay blank
+            row[key] = mean_or_blank([float(r[key]) for r in races if r.get(key) not in ("", None, "None")])
+        rows.append(row)
+    if not rows:
+        sys.exit(f"No results in {eval_dir}")
+    rows.sort(key=by_finish)
+    write_rows(eval_dir / "summary.csv", rows)
+    print_table(rows, "run", "races")
+    print(f"\nSaved {eval_dir / 'summary.csv'} (one row per run, sorted by finish rate, then finish time)")
+
+    # -- Each setting averaged over its training seeds: the std across seeds is how much luck moves it --
+    groups = {}
+    for row in rows:
+        groups.setdefault(SEED_SUFFIX.sub("", row["run"]), []).append(row)
+    settings = []
+    for setting, runs in groups.items():
+        if len(runs) < 2:
+            continue  # baselines and phase 2b evaluations have no seeds to average
+        averaged = {"setting": setting, "seeds": len(runs)}
+        for key in METRICS:
+            values = [r[key] for r in runs if r[key] != ""]
+            averaged[key] = mean_or_blank(values)
+            averaged[f"{key}_std"] = round(float(np.std(values, ddof=1)), 3) if len(values) > 1 else ""
+        settings.append(averaged)
+    if settings:
+        settings.sort(key=by_finish)
+        write_rows(eval_dir / "summary_by_setting.csv", settings)
+        print()
+        print_table(settings, "setting", "seeds", spread=True)
+        print(f"\nSaved {eval_dir / 'summary_by_setting.csv'} (each setting over its seeds: mean ± std; "
+              "a difference smaller than the stds is luck)")
 
 
 def sanity(args):
@@ -258,7 +324,7 @@ def main():
     parser.add_argument("phase", nargs="?", choices=["phase1", "phase2"], help="for summary")
     parser.add_argument("--only", type=lambda s: set(s.split(",")), default=None, help="comma-separated run names")
     parser.add_argument("--seeds", type=lambda s: [int(x) for x in s.split(",")], default=None,
-                        help="training seeds (default: phase 1 uses SEEDS, phase 2 uses 0)")
+                        help="training seeds (default: phase 1 uses SEEDS, phase 2 uses PHASE2_SEEDS)")
     parser.add_argument("--fixed-policy", default=None, help="overrides FIXED_POLICY for phase 2")
     parser.add_argument("--races", type=int, default=None, help="races per evaluation (default 20, --quick 1)")
     parser.add_argument("--env", action="append", default=[], metavar="KEY=VALUE", help="for sanity")

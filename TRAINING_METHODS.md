@@ -72,7 +72,7 @@ This is "learning by cheating": a teacher with privileged information trains a s
 
 ## Evaluation (`evaluate.py`)
 
-Each checkpoint races 20 fixed seeds with its mean action. Every race records finished, won, stuck, finish time, distance, mean speed, off-road fraction, steering jerk, yaw rate and crashes. The race seed barely changes a fixed policy's race, so differences between training seeds matter more than the number of races. `sweep.py summary` averages each CSV into one row per policy.
+Each checkpoint races 20 fixed seeds with its mean action. Every race records finished, won, stuck, finish time, distance, mean speed, off-road fraction, steering jerk, yaw rate, crashes, and how often the policy pressed brake, drift and nitro. Races don't repeat exactly, even on the same seed, so 20 races average out race-to-race variation; differences between training seeds are the bigger source of luck. `sweep.py summary` averages each CSV into one row per policy, then averages each setting over its training seeds (mean ± standard deviation).
 
 ## Experiments (`sweep.py`)
 
@@ -81,10 +81,10 @@ Each checkpoint races 20 fixed seeds with its mean action. Every race records fi
 | Sanity | Score stand still, reverse, random and the path follower under the reward | Make sure quitting never beats driving |
 | Warm start | Record the teacher, clone it, refine with DAgger, evaluate the clone | Starting point for every SAC run, and a reference row |
 | Phase 1 | γ ∈ {0.98, 0.99, 0.995} × 2 seeds, 150k steps each, checkpoints evaluated at 50k/100k/150k | Choose γ and training length; seeds show what's luck |
-| Phase 2a | Fine-tune the chosen checkpoint for 50k steps under each reward or physics change, plus an unchanged control | How the agent's decisions adapt (speed vs. recklessness) |
-| Phase 2b | Evaluate the chosen checkpoint, unchanged, under world changes | Robustness: expert opponent, more karts, noise, delay, another kart, an unseen track |
+| Phase 2a | Fine-tune the chosen checkpoint for 50k steps under each of 8 reward or physics changes, plus an unchanged control, each with 3 seeds | How the agent's decisions adapt (speed vs. recklessness) |
+| Phase 2b | Evaluate the chosen checkpoint, unchanged, under world changes, several at more than one strength | Robustness: harder opponents, more karts, noise, delay, another kart, an unseen track |
 
-Phase 2 fine-tunes from one policy rather than retraining each change from scratch: it halves the cost and isolates the effect of the change from run-to-run luck. The unchanged control gets the same extra training, so every comparison is fair.
+Phase 2 fine-tunes from one policy rather than retraining each change from scratch: it halves the cost and starts every change from the same driver. The unchanged control gets the same extra training, so every comparison is fair, and its 3 seeds show how far fine-tuning luck alone moves the results: a change only counts if it moves them further than that.
 
 ## Key choices and why
 
