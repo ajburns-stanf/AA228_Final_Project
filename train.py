@@ -34,12 +34,19 @@ AGENT_MODULES = ('encoder', 'belief', 'actor', 'critic1', 'critic2', 'critic1_ta
 
 def save_checkpoint(path, agent, args, step):
     """Save weights, optimizers, alpha, step and settings (replay isn't saved)."""
-    config = {**vars(args), 'run_dir': str(args.run_dir)}
+    # Paths saved as text, so the checkpoint is plain data (loads with torch's default weights_only=True)
+    config = {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}
     # SACAgent is a plain class, so save its modules individually.
     models = {name: getattr(agent, name).state_dict() for name in AGENT_MODULES}
     torch.save({'step': step, 'config': config, 'agent': models, 'log_alpha': agent.log_alpha.item(),
                 'actor_optimizer': agent.actor_optimizer.state_dict(),
                 'critic_optimizer': agent.critic_optimizer.state_dict()}, path)
+
+
+def training_difficulty(path, default):
+    """The opponent difficulty a checkpoint was trained (or recorded) at; default if it doesn't say."""
+    config = torch.load(path, map_location='cpu', weights_only=False).get('config', {})
+    return config.get('difficulty', default)
 
 
 def load_weights(agent, path):

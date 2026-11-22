@@ -11,6 +11,7 @@ venv/
 frames/
 
 # === Training output (large; share checkpoints another way, or force-add a final one) ===
+# Force-added: runs/phase1/gamma_0.995_s1/step_100000.pt (FIXED_POLICY, the starting point of phase 2)
 runs/
 checkpoints/
 logs/

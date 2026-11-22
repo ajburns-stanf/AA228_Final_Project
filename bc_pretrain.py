@@ -139,6 +139,7 @@ def main():
         np.savez(args.out / "demos.npz", **demos)
         print(f"Saved {len(demos['actions'])} transitions to {args.out / 'demos.npz'}", flush=True)
         config = {"embedding_dim": args.embedding_dim, "lr": args.lr, "alpha": 0.2, "gamma": 0.99,
+                  "difficulty": args.difficulty,
                   "bc_episodes": args.episodes, "bc_steps": args.steps, "bc_noise": args.noise,
                   "dagger_rounds": args.dagger_rounds, "dagger_episodes": args.dagger_episodes}
         torch.save({"step": 0, "config": config,

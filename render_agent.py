@@ -1,6 +1,8 @@
 # === Render a Trained Pixel Agent to MP4 ===
 """Runs a trained pixel SAC agent (a train.py final.pt) for one race and saves it as a 1920x1080 MP4.
-- Usage: python render_agent.py [--checkpoint runs/full_training_01/final.pt] [--out video.mp4] [--seed 0] [--stochastic]
+- Usage: python render_agent.py [--checkpoint runs/full_training_01/final.pt] [--out video.mp4] [--seed 0]
+  [--difficulty N] [--stochastic]
+- Races at the opponent difficulty the checkpoint was trained at, unless --difficulty says otherwise.
 - Two passes, because pystk2 renders at one resolution per process and the agent must see the 128x96
   frames it was trained on:
   1. A worker process lets the agent drive at the training resolution and records its actions.
@@ -20,7 +22,7 @@ from PIL import Image
 
 import environment  # imported first: sets up the STK DLLs on Windows
 from SAC_CNN_Pixels import SACAgent
-from train import to_env
+from train import to_env, training_difficulty
 
 # === Definitions ===
 CHECKPOINT = Path("runs/full_training_01/final.pt")
@@ -32,7 +34,7 @@ MAX_DRIFT = 1.0  # meters the replay may differ from the agent's own drive befor
 
 def load_agent(path, action_dim):
     """Rebuild the SACAgent from a train.py checkpoint."""
-    checkpoint = torch.load(path, map_location="cpu")
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)  # our own checkpoint; its config may hold paths
     config = checkpoint["config"]
     agent = SACAgent(state_dim=config["embedding_dim"], action_dim=action_dim, lr=config["lr"],
                      alpha=config["alpha"], gamma=config["gamma"])
@@ -46,9 +48,9 @@ def kart_location(env):
 
 
 # === Pass 1: the agent drives (worker process) ===
-def drive(checkpoint, seed, deterministic, results):
+def drive(checkpoint, seed, deterministic, difficulty, results):
     """Run one race at the training resolution; send back the actions taken and the kart's positions."""
-    env = environment.make_env("pixels")
+    env = environment.make_env("pixels", difficulty)
     agent, trained_steps = load_agent(
         checkpoint, env.action_space.shape[0]
     )  # 5 actions: accel, steer, brake, drift, nitro
@@ -69,7 +71,7 @@ def drive(checkpoint, seed, deterministic, results):
 
 
 # === Pass 2: replay and record at 1920x1080 (this process) ===
-def record(run, seed, out):
+def record(run, seed, out, difficulty):
     """Replay the recorded actions in the same seeded race and write every frame to out."""
     # -- With Windows display scaling (e.g. 150%), an unaware process gets a smaller game window. --
     # Opt this process out so it renders at real pixels (the driving process stays as in training).
@@ -80,7 +82,7 @@ def record(run, seed, out):
         except (AttributeError, OSError):
             pass
     environment.FRAME_SIZE = VIDEO_SIZE  # render this process's frames at video resolution
-    env = environment.make_env("pixels")
+    env = environment.make_env("pixels", difficulty)
     frame, _ = env.reset(seed=seed)
 
     def to_video_size(frame):
@@ -108,14 +110,21 @@ def main():
     parser.add_argument("--checkpoint", type=Path, default=CHECKPOINT)
     parser.add_argument("--out", type=Path, default=None, help="default: <checkpoint folder>/agent_seed<seed>_1080p.mp4")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--difficulty", type=int, choices=(0, 1, 2), default=None,
+                        help="opponent AI: 0 novice, 1 intermediate, 2 expert (default: the checkpoint's)")
     parser.add_argument("--stochastic", action="store_true", help="sample actions instead of using the mean action")
     args = parser.parse_args()
     out = args.out or args.checkpoint.parent / f"agent_seed{args.seed}_1080p.mp4"
+    difficulty = args.difficulty
+    if difficulty is None:  # race the opponent it trained against (difficulty also changes our kart's speed)
+        difficulty = training_difficulty(args.checkpoint, environment.DIFFICULTY)
+    print(f"Opponent difficulty: {difficulty} ({['novice', 'intermediate', 'expert'][difficulty]})")
 
     # -- Pass 1 in its own process, at the training resolution --
     context = mp.get_context("spawn")
     results = context.Queue()
-    worker = context.Process(target=drive, args=(str(args.checkpoint), args.seed, not args.stochastic, results))
+    worker = context.Process(target=drive, args=(str(args.checkpoint), args.seed, not args.stochastic,
+                                                 difficulty, results))
     worker.start()
     run = results.get()  # read before join, so the worker can exit
     worker.join()
@@ -124,7 +133,7 @@ def main():
           f"distance {run['distance']:.0f} m | {lap} | {run['steps']} steps")
 
     # -- Pass 2 here, at 1920x1080 --
-    drift = record(run, args.seed, out)
+    drift = record(run, args.seed, out, difficulty)
     print(f"Saved {out} ({out.stat().st_size / 1e6:.1f} MB, {VIDEO_SIZE[0]}x{VIDEO_SIZE[1]}, "
           f"{run['steps'] + 1} frames at {FPS} fps)")
     if drift > MAX_DRIFT:
