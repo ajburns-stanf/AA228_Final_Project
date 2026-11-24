@@ -30,6 +30,16 @@ def random_shift(obs, pad=SHIFT_PAD):
     return x.reshape(B, T, C, H, W).permute(0, 1, 3, 4, 2)
 
 
+class MPSCompatibleAdaptiveAvgPool2d(nn.AdaptiveAvgPool2d):
+    def forward(self, x):
+        if x.device.type == "mps" and (
+            x.shape[-2] % self.output_size[0] or x.shape[-1] % self.output_size[1]
+        ):
+            # CPU pooling supports arbitrary sizes and preserves autograd through copies.
+            return super().forward(x.cpu()).to(x.device)
+        return super().forward(x)
+
+
 class CNNEncoder(nn.Module):
     def __init__(self, embedding_dim=128):
         super().__init__()
@@ -44,7 +54,7 @@ class CNNEncoder(nn.Module):
 
             nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
-            nn.AdaptiveAvgPool2d((6, 8))
+            MPSCompatibleAdaptiveAvgPool2d((6, 8))
         )
         self.fc = nn.Linear(64 * 6 * 8, embedding_dim)
 
@@ -153,7 +163,11 @@ class SACAgent:
 
     def update(self, batch, update_actor=True):
         """One gradient step. update_actor=False trains only the critics (used for a critic warm-up)."""
-        obs, a, r, terminated = (torch.as_tensor(x, device=self.device) for x in batch)
+        obs = torch.as_tensor(batch[0], device=self.device)
+        # Convert before transferring: MPS cannot hold NumPy's default float64.
+        a, r, terminated = (
+            torch.as_tensor(x, dtype=torch.float32, device=self.device) for x in batch[1:]
+        )
         if self.augment:
             obs = random_shift(obs)  # same few-pixel shift across each sequence
         a = a.float()
